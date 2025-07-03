@@ -15,7 +15,9 @@ Please check `env_setup.sh`.
 
 Download and place the pre-trained Transformer-based backbones to './models/'. In our study, we use the [ViT-Base pre-trained](https://drive.google.com/file/d/11KuAkntDTPPcq4h4JwSjbDebNgVkgceA/view?usp=drive_link) on Imagenet-21k.
 
-## Dataset Prepairation
+## Dataset Preparation
+
+Download and place the pre-trained Transformer-based backbones to './Datasets/'.
 
   Cotton disease dataset: [https://www.kaggle.com/datasets/dhamur/cotton-plant-disease](https://www.kaggle.com/datasets/dhamur/cotton-plant-disease)
   
@@ -25,7 +27,6 @@ Download and place the pre-trained Transformer-based backbones to './models/'. I
   
   Tomato disease dataset and Plant village dataset: [https://github.com/spMohanty/PlantVillage-Dataset/tree/master/raw](https://github.com/spMohanty/PlantVillage-Dataset/tree/master/raw)
 
-please split the dataset by using our code.
 
 ## Train
 
@@ -34,8 +35,6 @@ please split the dataset by using our code.
 
 
 ## We will release the complete code and complete this documentation after our manuscript is accepted.
-
-## How to use this code for a customer dataset?
 
 
 
