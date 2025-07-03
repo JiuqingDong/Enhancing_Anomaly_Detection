@@ -1,0 +1,529 @@
+#!/usr/bin/env python3
+"""
+a trainer class
+"""
+import datetime
+import time
+import torch
+import torch.nn as nn
+import os
+from scipy import stats
+from scipy.stats import entropy
+import torch.nn.init as init
+from fvcore.common.config import CfgNode
+from fvcore.common.checkpoint import Checkpointer
+
+from ..engine.evaluator import Evaluator, get_and_print_results
+from ..solver.lr_scheduler import make_scheduler
+from ..solver.optimizer import make_optimizer
+from ..solver.losses import build_loss
+from ..utils import logging
+from ..utils.plot_util import plot_distribution
+from ..utils.train_utils import AverageMeter, gpu_mem_usage
+
+from src.data import loader as data_loader
+from src.analysis.kNN_Eval import kNN_OOD
+
+
+import numpy as np
+import torch.nn.functional as F
+
+
+def setup_log():
+    log = logging.get_logger("FS-OOD")
+    log.debug(f"#####################")
+    return log
+
+
+logger = logging.get_logger("FS-OOD")
+
+
+class Concat_Classifier(nn.Module):
+    def __init__(self, cfg):
+        super(Concat_Classifier, self).__init__()
+        self.num_classes = cfg.DATA.NUMBER_CLASSES
+        self.output_layer = nn.Linear(768 * 2, self.num_classes)
+
+        init.xavier_normal_(self.output_layer.weight)
+        init.constant_(self.output_layer.bias, 0.0)
+
+    def forward(self, feature1, feature2):
+        x = torch.cat((feature1, feature2), dim=1)
+        output = self.output_layer(x)
+
+        return output
+
+
+class Trainer():
+    """
+    a trainer with below logics:
+    1. Build optimizer, scheduler
+    2. Load checkpoints if provided
+    3. Train and eval at each epoch
+    """
+    def __init__(
+            self,
+            cfg: CfgNode,
+            model: nn.Module,
+            evaluator: Evaluator,
+            device: torch.device,
+            model2: nn.Module,
+    ) -> None:
+        self.cfg = cfg
+        self.model = model
+        self.model2 = model2
+        self.device = device
+        self.concat_classesfier = Concat_Classifier(cfg).cuda(device=self.device)
+
+        # solver related
+        logger.info("\tSetting up the optimizer...")
+
+        self.optimizer = make_optimizer([self.concat_classesfier], cfg.SOLVER)
+        self.scheduler = make_scheduler(self.optimizer, cfg.SOLVER)
+
+        self.cls_criterion = build_loss(self.cfg)
+
+        self.checkpointer = Checkpointer(self.model, save_dir=cfg.OUTPUT_DIR, save_to_disk=True)
+        self.log = setup_log()
+
+        if len(cfg.MODEL.WEIGHT_PATH) > 0:
+            model.load_state_dict(torch.load(cfg.MODEL.WEIGHT_PATH))
+        if len(cfg.MODEL.WEIGHT_PATH_CLS) > 0:
+            self.concat_classesfier.load_state_dict(torch.load(cfg.MODEL.WEIGHT_PATH_CLS))
+        self.evaluator = evaluator
+        self.cpu_device = torch.device("cpu")
+
+        if self.cfg.DATA.NAME == 'plant_village': self.ood_dataset_dic = {"plant_village": data_loader.construct_ood_loader(cfg, "ood"),}
+        #     self.ood_dataset_dic = {"apple" : data_loader.construct_ood_loader(cfg, "ood_apple" ),
+        #                             "corn"  : data_loader.construct_ood_loader(cfg, "ood_corn"  ),
+        #                             "grape" : data_loader.construct_ood_loader(cfg, "ood_grape" ),
+        #                             "potato": data_loader.construct_ood_loader(cfg, "ood_potato"),
+        #                             "tomato": data_loader.construct_ood_loader(cfg, "ood_tomato"),
+        #                             "others": data_loader.construct_ood_loader(cfg, "ood_others"),}
+        elif self.cfg.DATA.NAME == 'pvt':
+            self.ood_dataset_dic = {"apple"  : data_loader.construct_ood_loader(cfg, "ood_apple"),
+                                    "corn"   : data_loader.construct_ood_loader(cfg, "ood_corn"),
+                                    "grape"  : data_loader.construct_ood_loader(cfg, "ood_grape" ),
+                                    "potato" : data_loader.construct_ood_loader(cfg, "ood_potato"),
+                                    "healthy": data_loader.construct_ood_loader(cfg, "ood_healthy"),
+                                    "disease": data_loader.construct_ood_loader(cfg, "ood_disease")
+                                    }
+        elif self.cfg.DATA.NAME == 'herbarium_19':
+            self.ood_dataset_dic = {"Top_25" : data_loader.construct_ood_loader(cfg, "ood_Top_25" ),
+                                    "Top_50" : data_loader.construct_ood_loader(cfg, "ood_Top_50"),
+                                    "Top_100": data_loader.construct_ood_loader(cfg, "ood_Top_100"),
+                                    "Top_200": data_loader.construct_ood_loader(cfg, "ood_Top_200"),
+                                    "Top_300": data_loader.construct_ood_loader(cfg, "ood_Top_300"),
+                                    "Top_342": data_loader.construct_ood_loader(cfg, "ood_Top_342")
+                                    }
+        elif self.cfg.DATA.NAME == 'paddy10':
+            self.ood_dataset_dic = {
+                "paddy": data_loader.construct_ood_loader(cfg, "ood_paddy"),
+            }
+        elif self.cfg.DATA.NAME == 'cotton':
+            self.ood_dataset_dic = {
+                "cotton": data_loader.construct_ood_loader(cfg, "ood_cotton"),
+            }
+        elif self.cfg.DATA.NAME == 'strawberry':
+            self.ood_dataset_dic = {
+                "strawberry": data_loader.construct_ood_loader(cfg, "ood_strawberry"),
+            }
+        elif self.cfg.DATA.NAME == 'mango':
+            self.ood_dataset_dic = {
+                "mango": data_loader.construct_ood_loader(cfg, "ood_mango"),
+            }
+        elif self.cfg.DATA.NAME == 'pvtc':
+            self.ood_dataset_dic = {
+                "pvtc": data_loader.construct_ood_loader(cfg, "ood_pvtc"),
+            }
+        elif self.cfg.DATA.NAME == 'pvtg':
+            self.ood_dataset_dic = {
+                "pvtg": data_loader.construct_ood_loader(cfg, "ood_pvtg"),
+            }
+        elif self.cfg.DATA.NAME == 'pvts':
+            self.ood_dataset_dic = {
+                "pvts": data_loader.construct_ood_loader(cfg, "ood_pvts"),
+            }
+        else:
+            print("===========ERROR===========")
+
+        self.train_copy_loader = data_loader.construct_train_copy_loader(cfg)
+
+    def forward_one_batch(self, inputs, targets, is_train):
+        """Train a single (full) epoch on the model using the given data loader.
+        Args:                          ||         Returns:
+            X: input dict              ||         loss
+            targets                    ||         outputs: output logits
+            is_train: bool             ||         feature: [Batch, 784]
+        """
+        # move data to device
+        inputs = inputs.to(self.device, non_blocking=True)  # (batchsize, 2048)
+        targets = targets.to(self.device, non_blocking=True)  # (batchsize, )
+
+        # forward
+        with torch.set_grad_enabled(is_train):
+            output1, feature1 = self.model(inputs)  # (batchsize, num_cls)
+            output2, feature2 = self.model2(inputs)  #
+            output_logits = self.concat_classesfier(feature1, feature2)
+
+            if self.cls_criterion.is_local() and is_train:
+                self.model.eval()
+                self.model2.eval()
+                # loss = self.cls_criterion(outputs, targets, self.cls_weights, self.model, inputs)
+                loss = self.cls_criterion(output_logits, targets, self.cls_weights, self.concat_classesfier)
+
+            elif self.cls_criterion.is_local():
+                return torch.tensor(1), output_logits
+            else:
+                # loss = self.cls_criterion(outputs, targets, self.cls_weights)
+                loss = self.cls_criterion(output_logits, targets, self.cls_weights)
+
+            if loss == float('inf'):
+                logger.info("encountered infinite loss, skip gradient updating for this batch!")
+                return -1, -1
+            elif torch.isnan(loss).any():
+                logger.info("encountered nan loss, skip gradient updating for this batch!")
+                return -1, -1
+
+        # =======backward and optim step only if in training phase... =========
+        if is_train:
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+        feature = torch.cat((feature1, feature2), dim=1)
+        return loss, output_logits, feature
+
+    def get_input(self, data):
+        if not isinstance(data["image"], torch.Tensor):
+            for k, v in data.items():
+                data[k] = torch.from_numpy(v)
+        inputs = data["image"].float()
+        labels = data["label"]
+        return inputs, labels
+
+    def train_classifier(self, train_loader, val_loader, test_loader):
+        """
+        Train a classifier using epoch
+        """
+        # save the model prompt if required before training
+        self.model.eval()
+        self.model2.eval()
+        self.concat_classesfier.eval()
+        self.save_prompt(0)
+
+        # setup training epoch params
+        total_epoch = self.cfg.SOLVER.TOTAL_EPOCH
+        total_data = len(train_loader)
+        best_metric = 0
+        log_interval = self.cfg.SOLVER.LOG_EVERY_N
+
+        losses = AverageMeter('Loss', ':.4e')
+        batch_time = AverageMeter('Time', ':6.3f')
+        data_time = AverageMeter('Data', ':6.3f')
+
+        self.cls_weights = train_loader.dataset.get_class_weights(self.cfg.DATA.CLASS_WEIGHTS_TYPE)
+
+        # patience = 0  # if > self.cfg.SOLVER.PATIENCE, stop training
+
+        for epoch in range(total_epoch):
+            # if epoch == 0 :
+            # self.ood_evaluator(test_loader, epoch=epoch)
+
+            # reset averagemeters to measure per-epoch results
+            losses.reset()
+            batch_time.reset()
+            data_time.reset()
+
+            lr = self.scheduler.get_lr()[0]
+            logger.info("Training {} / {} epoch, with learning rate {}".format(epoch + 1, total_epoch, lr))
+
+            self.concat_classesfier.train()
+
+            end = time.time()
+
+            for idx, input_data in enumerate(train_loader):
+                if self.cfg.DBG and idx == 20:
+                    # if debugging, only need to see the first few iterations
+                    break
+
+                X, targets = self.get_input(input_data)
+
+                data_time.update(time.time() - end)
+
+                train_loss, _, _ = self.forward_one_batch(X, targets, True)
+
+                if train_loss == -1:
+                    # continue
+                    return None
+
+                losses.update(train_loss.item(), X.shape[0])
+
+                # measure elapsed time
+                batch_time.update(time.time() - end)
+                end = time.time()
+
+                # log during one batch
+                if (idx + 1) % log_interval == 0:
+                    seconds_per_batch = batch_time.val
+                    eta = datetime.timedelta(seconds=int(seconds_per_batch * (total_data - idx - 1)
+                                                         + seconds_per_batch * total_data * (total_epoch - epoch - 1)))
+
+                    logger.info("\tTraining {}/{}. train loss: {:.4f},".format(idx + 1, total_data, train_loss)
+                        + "\t{:.4f} s / batch. (data: {:.2e}). ETA={}, ".format(seconds_per_batch, data_time.val, str(eta),)
+                        + "max mem: {:.1f} GB ".format(gpu_mem_usage()))
+
+            logger.info("Epoch {} / {}: ".format(epoch + 1, total_epoch)
+                        + "avg data time: {:.2e}, avg batch time: {:.4f}, ".format(data_time.avg, batch_time.avg)
+                        + "average train loss: {:.4f}".format(losses.avg))
+
+            # update lr, scheduler.step() must be called after optimizer.step() according to the docs: https://pytorch.org/docs/stable/optim.html#how-to-adjust-learning-rate  # noqa
+            self.scheduler.step()
+
+            # Enable eval mode
+            self.model.eval()
+            self.model2.eval()
+            self.concat_classesfier.eval()
+            self.save_prompt(epoch + 1)
+
+            # eval at each epoch for single gpu training
+            self.evaluator.update_iteration(epoch)
+            self.eval_classifier(val_loader, "val")
+
+            # check the patience
+            t_name = "val_" + val_loader.dataset.name
+            try:
+                curr_acc = self.evaluator.results[f"epoch_{epoch}"]["classification"][t_name]["top1"]
+            except KeyError:
+                return
+
+            if curr_acc > best_metric:
+                model_state = self.concat_classesfier.state_dict()
+                out_path = os.path.join(self.cfg.OUTPUT_DIR, f"{t_name}_best_concat_classesfier.pth")
+                torch.save(model_state, out_path)
+                logger.info(f"Saved model for {t_name} at {out_path}")
+
+                best_metric = curr_acc
+                best_epoch = epoch + 1
+                logger.info(
+                    f'Best epoch {best_epoch}: best metric: {best_metric:.3f}')
+                patience = 0
+                if best_metric > 0.2:
+                    if test_loader is not None:
+                        self.ood_evaluator(test_loader, epoch=epoch)
+            # else:
+            #     patience += 1
+            #     if patience >= self.cfg.SOLVER.PATIENCE:
+            #         logger.info("No improvement. Breaking out of loop.")
+            #         break
+
+            # if epoch == total_epoch - 1:
+            #     model_state = self.concat_classesfier.state_dict()
+            #     out_path = os.path.join(self.cfg.OUTPUT_DIR, f"{t_name}_last_concat_classesfier.pth")
+            #     torch.save(model_state, out_path)
+            #     logger.info(f"Saved model for {t_name} at {out_path}")
+            #     self.ood_evaluator(test_loader, epoch=epoch)
+
+    @torch.no_grad()
+    def save_prompt(self, epoch):
+        # only save the prompt embed if below conditions are satisfied
+        if self.cfg.MODEL.PROMPT.SAVE_FOR_EACH_EPOCH:
+            if self.cfg.MODEL.TYPE == "vit" and "prompt" in self.cfg.MODEL.TRANSFER_TYPE:
+                prompt_embds = self.model.enc.transformer.prompt_embeddings.cpu().numpy()
+                out = {"shallow_prompt": prompt_embds}
+                if self.cfg.MODEL.PROMPT.DEEP:
+                    deep_embds = self.model.enc.transformer.deep_prompt_embeddings.cpu().numpy()
+                    out["deep_prompt"] = deep_embds
+                torch.save(out, os.path.join(
+                    self.cfg.OUTPUT_DIR, f"prompt_ep{epoch}.pth"))
+
+    def eval_classifier(self, data_loader, prefix):
+        """evaluate classifier"""
+        batch_time = AverageMeter('Time', ':6.3f')
+        data_time = AverageMeter('Data', ':6.3f')
+        losses = AverageMeter('Loss', ':.4e')
+
+        log_interval = self.cfg.SOLVER.LOG_EVERY_N
+        test_name = prefix + "_" + data_loader.dataset.name
+        total = len(data_loader)
+
+        # initialize features and target
+        total_logits = []
+        total_targets = []
+        for idx, input_data in enumerate(data_loader):
+            end = time.time()
+            X, targets = self.get_input(input_data)
+            # measure data loading time
+            data_time.update(time.time() - end)
+
+            loss, output, _ = self.forward_one_batch(X, targets, False)
+
+            if loss == -1:
+                return
+            losses.update(loss, X.shape[0])
+
+            # measure elapsed time
+            batch_time.update(time.time() - end)
+
+            if (idx + 1) % log_interval == 0:
+                logger.info("\tTest {}/{}. loss: {:.3f}, {:.4f} s / batch. (data: {:.2e})"
+                            .format(idx + 1,total,losses.val,batch_time.val,data_time.val)
+                            + "max mem: {:.5f} GB ".format(gpu_mem_usage()))
+
+            # targets: List[int]
+            total_targets.extend(list(targets.numpy()))
+            total_logits.append(output)
+        logger.info(
+            f"Inference ({prefix}):"
+            + "avg data time: {:.2e}, avg batch time: {:.4f}, ".format(
+                data_time.avg, batch_time.avg)
+            + "average loss: {:.4f}".format(losses.avg))
+        if self.model.side is not None:
+            logger.info("--> side tuning alpha = {:.4f}".format(self.model.side_alpha))
+        # total_testimages x num_classes
+        joint_logits = torch.cat(total_logits, dim=0).cpu().numpy()
+        # print("joint_logits", joint_logits.shape, joint_logits)     # （N_Images, Classes)
+        self.evaluator.classify(joint_logits, total_targets, test_name, self.cfg.DATA.MULTILABEL,)
+
+    @torch.no_grad()
+    def feature_save(self, data_loader, epoch, prefix=None):
+        """save the features as npy"""
+        features = []
+        for idx, input_data in enumerate(data_loader):
+            X, targets = self.get_input(input_data)
+            _, _, feature = self.forward_one_batch(X, targets, False)
+            features.append(feature.cpu().detach())  # 将feature从GPU复制到CPU
+        all_feature = torch.cat(features, dim=0)
+        features_array = np.array(all_feature)
+        # 保存为npy文件
+        if epoch != 0:
+            epoch = 'best'
+        output_file = os.path.join(self.cfg.OUTPUT_DIR, f"epoch_{epoch}_{prefix}_feature.npy")
+
+        np.save(output_file, features_array)
+        print(f"Feature was saved as {output_file}")
+
+
+    def save_logits(self, logits, epoch, name, method):
+        logits_array = np.array(logits)
+        # 保存为npy文件
+        if epoch != 0:
+            epoch = 'best'
+
+        output_file = os.path.join(self.cfg.OUTPUT_DIR, f"epoch_{epoch}_{name}_{method}.npy")
+        np.save(output_file, logits_array)
+        print(f"Logits was saved as {output_file}")
+
+    @torch.no_grad()
+    def ood_evaluator(self, data_loader, epoch=None, T=1):
+        """ood_evaluator"""
+        to_np = lambda x: x.data.cpu().numpy()
+        concat = lambda x: np.concatenate(x, axis=0)
+
+        # initialize features and target
+        InD_score_energy = []
+        InD_score_entropy = []
+        InD_score_var = []
+        InD_score_msp = []
+        InD_score_max_logits = []
+
+        for idx, input_data in enumerate(data_loader):
+            X, targets = self.get_input(input_data)
+            _, outputs, _feat = self.forward_one_batch(X, targets, False)
+            # print("outputs",outputs, outputs.shape)     # [Batch_size, IND_Classes]
+            if _ == -1:
+                return
+
+            smax = to_np(F.softmax(outputs / T, dim=1))
+            InD_score_energy.append(-to_np((T * torch.logsumexp(outputs / T, dim=1)))) # Energy
+            InD_score_entropy.append(entropy(smax, axis=1))            # entropy
+            InD_score_var.append(-np.var(smax, axis=1))            # var
+            InD_score_msp.append(-np.max(smax, axis=1))            # msp
+            max_logit = to_np(outputs / T)
+            InD_score_max_logits.append(-np.max(max_logit, axis=1))            # max_logits
+
+        # total_testimages x num_classes
+        InD_score_energy = concat(InD_score_energy)[:len(data_loader.dataset)].copy()
+        InD_score_entropy = concat(InD_score_entropy)[:len(data_loader.dataset)].copy()
+        InD_score_var = concat(InD_score_var)[:len(data_loader.dataset)].copy()
+        InD_score_msp = concat(InD_score_msp)[:len(data_loader.dataset)].copy()
+        InD_score_max_logits = concat(InD_score_max_logits)[:len(data_loader.dataset)].copy()
+
+
+        self.feature_save(self.train_copy_loader, epoch, prefix='InD_train')
+        self.feature_save(data_loader, epoch, prefix='InD_test')
+
+        for name, ood_loader in self.ood_dataset_dic.items():
+            # initialize features and target
+            OOD_score_energy = []
+            OOD_score_entropy = []
+            OOD_score_var = []
+            OOD_score_msp = []
+            OOD_score_max_logits = []
+
+            auroc_list, aupr_list, fpr_list = [], [], []
+            self.feature_save(ood_loader, epoch, prefix='OOD_' + name)
+
+
+
+            for idx, input_data in enumerate(ood_loader):
+                X, targets = self.get_input(input_data)
+                _, outputs, _feature = self.forward_one_batch(X, targets, False)
+
+                if _ == -1:
+                    return
+
+                smax = to_np(F.softmax(outputs / T, dim=1))
+                OOD_score_energy.append(-to_np((T * torch.logsumexp(outputs / T, dim=1))))                # energy
+                OOD_score_entropy.append(entropy(smax, axis=1))                # entropy
+                OOD_score_var.append(-np.var(smax, axis=1))                # var
+                OOD_score_msp.append(-np.max(smax, axis=1))                # msp
+                max_logit = to_np(outputs / T)
+                OOD_score_max_logits.append(-np.max(max_logit, axis=1))                # max_logits
+
+            # total_testimages x num_classes
+            OOD_score_energy = concat(OOD_score_energy)[:len(ood_loader.dataset)].copy()
+            OOD_score_entropy = concat(OOD_score_entropy)[:len(ood_loader.dataset)].copy()
+            OOD_score_var = concat(OOD_score_var)[:len(ood_loader.dataset)].copy()
+            OOD_score_msp = concat(OOD_score_msp)[:len(ood_loader.dataset)].copy()
+            OOD_score_max_logits = concat(OOD_score_max_logits)[:len(ood_loader.dataset)].copy()
+            InD_knn_feature, OOD_knn_feature = kNN_OOD(root=self.cfg.OUTPUT_DIR, epoch=epoch, name=name)
+
+            # Final results: FPR@95, AUROC, AUPR
+            logger.info(f"====OOD DATASET {name}===")
+            logger.info(f"====OOD_score_energy_energy====")
+            get_and_print_results(logger, InD_score_energy, OOD_score_energy, auroc_list, aupr_list, fpr_list)
+            logger.info(f"====OOD_score_entropy====")
+            get_and_print_results(logger, InD_score_entropy, OOD_score_entropy, auroc_list, aupr_list, fpr_list)
+            logger.info(f"======OOD_score_var======")
+            get_and_print_results(logger, InD_score_var, OOD_score_var, auroc_list, aupr_list, fpr_list)
+            logger.info(f"======OOD_score_msp======")
+            get_and_print_results(logger, InD_score_msp, OOD_score_msp, auroc_list, aupr_list, fpr_list)
+            logger.info(f"======OOD_score_max_logits=====")
+            get_and_print_results(logger, InD_score_max_logits, OOD_score_max_logits, auroc_list, aupr_list, fpr_list)
+            logger.info(f"======OOD_kNN_feature=====")
+            get_and_print_results(logger, InD_knn_feature, OOD_knn_feature, auroc_list, aupr_list, fpr_list)
+
+            save_logits_score = True
+            if save_logits_score:
+                self.save_logits(InD_score_energy, epoch, name='test', method='energy_score')
+                self.save_logits(OOD_score_energy, epoch, name, method='energy_score')
+                self.save_logits(InD_score_entropy, epoch, name='test', method='entropy_score')
+                self.save_logits(OOD_score_entropy, epoch, name, method='entropy_score')
+                self.save_logits(InD_score_var, epoch, name='test', method='var_score')
+                self.save_logits(OOD_score_var, epoch, name, method='var_score')
+                self.save_logits(InD_score_msp, epoch, name='test', method='msp_score')
+                self.save_logits(OOD_score_msp, epoch, name, method='msp_score')
+                self.save_logits(InD_score_max_logits, epoch, name='test', method='max_logits_score')
+                self.save_logits(OOD_score_max_logits, epoch, name, method='max_logits_score')
+                self.save_logits(InD_knn_feature, epoch, name='test', method='kNN_score')
+                self.save_logits(OOD_knn_feature, epoch, name, method='kNN_score')
+
+            # # Visualize Distribution
+            plot = True
+            if plot:
+                plot_distribution(InD_score_energy, OOD_score_energy, epoch, f'{name}_energy', output_path = self.cfg.OUTPUT_DIR)
+                plot_distribution(InD_score_entropy, OOD_score_entropy, epoch, f'{name}_entropy', output_path = self.cfg.OUTPUT_DIR)
+                plot_distribution(InD_score_var, OOD_score_var, epoch, f'{name}_var', output_path = self.cfg.OUTPUT_DIR)
+                plot_distribution(InD_score_msp, OOD_score_msp, epoch, f'{name}_msp', output_path = self.cfg.OUTPUT_DIR)
+                plot_distribution(InD_score_max_logits, OOD_score_max_logits, epoch, f'{name}_max_logits', output_path = self.cfg.OUTPUT_DIR)
+                plot_distribution(InD_knn_feature, OOD_knn_feature, epoch, f'{name}_kNN_feature', output_path=self.cfg.OUTPUT_DIR)
